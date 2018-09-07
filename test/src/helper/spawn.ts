@@ -114,11 +114,14 @@ export default class CodeChain {
       let syncExtensionFlag = false;
       let initCompleteFlag = false;
       let resolveFlag = false;
+      const start = Date.now();
       readline.on("line", (line: string) => {
         if (!initCompleteFlag && line.includes("Initialization complete")) {
+          console.log(`${this.id}, Took ${Date.now() - start} ms to set initCompleteFlag`);
           initCompleteFlag = true;
         }
         if (!syncExtensionFlag && line.includes("Sync extension initialized")) {
+          console.log(`${this.id}, Took ${Date.now() - start} ms to set syncExtensionFlag`);
           syncExtensionFlag = true;
         }
         if (!resolveFlag && initCompleteFlag && syncExtensionFlag) {
