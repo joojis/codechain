@@ -111,13 +111,21 @@ export default class CodeChain {
         });
 
       const readline = createReadline({ input: this.process!.stderr });
-      let flag = false;
+      let syncExtensionFlag = false;
+      let initCompleteFlag = false;
+      let resolveFlag = false;
       readline.on("line", (line: string) => {
-        if (line.includes("Initialization complete")) {
-          flag = true;
-          resolve();
+        if (!initCompleteFlag && line.includes("Initialization complete")) {
+          initCompleteFlag = true;
         }
-        if (this.logFlag && flag) {
+        if (!syncExtensionFlag && line.includes("Sync extension initialized")) {
+          syncExtensionFlag = true;
+        }
+        if (!resolveFlag && initCompleteFlag && syncExtensionFlag) {
+          resolveFlag = true;
+          return resolve();
+        }
+        if (this.logFlag && resolveFlag) {
           appendFileSync(this.logPath, line + "\n");
         }
       });
