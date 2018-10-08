@@ -584,6 +584,9 @@ describe("transactions", () => {
             test.each([[5], [10], [100], [504]])(
                 "%p + 1 outputs",
                 async length => {
+                    if (length > 100) {
+                        jest.setTimeout(7000);
+                    }
                     const tx = node.sdk.core
                         .createAssetTransferTransaction()
                         .addInputs(assets[0])
