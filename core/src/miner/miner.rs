@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 
 use ckey::{public_to_address, Address, Password, PlatformAddress, Public};
 use cstate::{StateError, TopLevelState};
-use ctypes::parcel::{Error as ParcelError, IncompleteParcel};
+use ctypes::parcel::{Action, Error as ParcelError, IncompleteParcel};
+use ctypes::transaction::{Timelock, Transaction};
 use ctypes::BlockNumber;
 use parking_lot::{Mutex, RwLock};
 use primitives::{Bytes, H256, U256};
@@ -261,9 +262,13 @@ impl Miner {
                                 balance: client.latest_balance(&a),
                             }
                         };
+
+
                         let hash = parcel.hash();
-                        let result =
-                            mem_pool.add(parcel, origin, insertion_time, &fetch_account).map_err(StateError::from)?;
+                        let timelock = self.calculate_timelock(&parcel, client);
+                        let result = mem_pool
+                            .add(parcel, origin, insertion_time, timelock, &fetch_account)
+                            .map_err(StateError::from)?;
 
                         inserted.push(hash);
                         Ok(result)
@@ -277,6 +282,67 @@ impl Miner {
         }
 
         results
+    }
+
+    fn calculate_timelock<C: BlockChain>(&self, parcel: &SignedParcel, client: &C) -> Option<u64> {
+        match parcel.as_unsigned().action {
+            Action::AssetTransactionGroup {
+                ref transactions,
+                ..
+            } => {
+                let mut max_value = None;
+                for transaction in transactions {
+                    let inputs = match transaction {
+                        Transaction::AssetTransfer {
+                            inputs,
+                            ..
+                        } => inputs,
+                        Transaction::AssetCompose {
+                            inputs,
+                            ..
+                        } => inputs,
+                        _ => continue,
+                    };
+                    // FIXME: Read it from scheme.
+                    let block_produce_target: u64 = 30000; // 30s
+                    for input in inputs {
+                        if let Some(timelock) = &input.timelock {
+                            let target_block = match timelock {
+                                Timelock::Block(value) => *value,
+                                Timelock::BlockAge(value) => {
+                                    // FIXME: unwrap
+                                    client.transaction_block_number(input.prev_out.transaction_hash.into()).unwrap()
+                                        + *value
+                                }
+                                Timelock::Time(value) => {
+                                    if value <= &client.chain_info().best_block_timestamp {
+                                        continue
+                                    }
+                                    let remaining = value - client.chain_info().best_block_timestamp;
+                                    (remaining + block_produce_target - 1) / block_produce_target
+                                }
+                                Timelock::TimeAge(value) => {
+                                    // FIXME: unwrap
+                                    let absolute = client
+                                        .transaction_block_timestamp(input.prev_out.transaction_hash.into())
+                                        .unwrap() + value;
+                                    if absolute <= client.chain_info().best_block_timestamp {
+                                        continue
+                                    }
+                                    let remaining = absolute - client.chain_info().best_block_timestamp;
+                                    (remaining + block_produce_target - 1) / block_produce_target
+                                }
+                            };
+                            if max_value.is_none() || max_value.unwrap() < target_block {
+                                max_value = Some(target_block);
+                            }
+                        }
+                    }
+                }
+                max_value
+            }
+            _ => None,
+        }
     }
 
     /// Returns true if we had to prepare new pending block.
@@ -437,7 +503,7 @@ impl Miner {
         {
             let mut queue = self.mem_pool.write();
             for hash in invalid_parcels {
-                queue.remove(&hash, &fetch_nonce, RemovalReason::Invalid);
+                queue.remove(&hash, &fetch_nonce, RemovalReason::Invalid, &chain.chain_info().best_block_number);
             }
         }
         (block, original_work_hash)

@@ -97,6 +97,8 @@ struct ParcelOrder {
     insertion_id: u64,
     /// Origin of the parcel
     origin: ParcelOrigin,
+    /// Timelock
+    timelock: Option<BlockNumber>,
 }
 
 impl ParcelOrder {
@@ -112,6 +114,7 @@ impl ParcelOrder {
             hash: item.hash(),
             insertion_id: item.insertion_id,
             origin: item.origin,
+            timelock: item.timelock,
         }
     }
 
@@ -154,6 +157,14 @@ impl Ord for ParcelOrder {
             return b.fee.cmp(&self.fee)
         }
 
+        // Compare timelock, prefer the nearer from the present.
+        match (self.timelock, b.timelock) {
+            (Some(a), Some(b)) if a != b => return b.cmp(&a),
+            (Some(_), None) => return Ordering::Less,
+            (None, Some(_)) => return Ordering::Greater,
+            _ => (),
+        }
+
         // Lastly compare insertion_id
         self.insertion_id.cmp(&b.insertion_id)
     }
@@ -170,15 +181,24 @@ struct MemPoolItem {
     insertion_time: PoolingInstant,
     /// ID assigned upon insertion, should be unique.
     insertion_id: u64,
+    /// A timelock.
+    timelock: Option<BlockNumber>,
 }
 
 impl MemPoolItem {
-    fn new(parcel: SignedParcel, origin: ParcelOrigin, insertion_time: PoolingInstant, insertion_id: u64) -> Self {
+    fn new(
+        parcel: SignedParcel,
+        origin: ParcelOrigin,
+        insertion_time: PoolingInstant,
+        insertion_id: u64,
+        timelock: Option<BlockNumber>,
+    ) -> Self {
         MemPoolItem {
             parcel,
             origin,
             insertion_time,
             insertion_id,
+            timelock,
         }
     }
 
@@ -446,6 +466,7 @@ impl MemPool {
         parcel: SignedParcel,
         origin: ParcelOrigin,
         time: PoolingInstant,
+        timelock: Option<BlockNumber>,
         fetch_account: &F,
     ) -> Result<ParcelImportResult, ParcelError>
     where
@@ -454,7 +475,7 @@ impl MemPool {
             let hash = parcel.hash();
             let closed_parcel = parcel.clone();
 
-            let result = self.add_internal(parcel, origin, time, fetch_account);
+            let result = self.add_internal(parcel, origin, time, timelock, fetch_account);
             match result {
                 Ok(ParcelImportResult::Current) => {
                     self.local_parcels.mark_pending(hash);
@@ -472,7 +493,7 @@ impl MemPool {
             }
             result
         } else {
-            self.add_internal(parcel, origin, time, fetch_account)
+            self.add_internal(parcel, origin, time, timelock, fetch_account)
         }
     }
 
@@ -489,7 +510,7 @@ impl MemPool {
             .collect::<HashMap<_, _>>();
 
         for (signer, details) in signers.iter() {
-            self.cull(*signer, details.nonce);
+            self.cull(*signer, details.nonce, &current_time);
         }
 
         let max_time = self.max_time_in_pool;
@@ -518,7 +539,7 @@ impl MemPool {
         let fetch_nonce =
             |a: &Public| signers.get(a).expect("We fetch details for all signers from both current and future").nonce;
         for hash in invalid {
-            self.remove(&hash, &fetch_nonce, RemovalReason::Invalid);
+            self.remove(&hash, &fetch_nonce, RemovalReason::Invalid, &current_time);
         }
     }
 
@@ -527,8 +548,13 @@ impl MemPool {
     /// so parcels left in pool are processed according to client nonce.
     ///
     /// If gap is introduced marks subsequent parcels as future
-    pub fn remove<F>(&mut self, parcel_hash: &H256, fetch_nonce: &F, reason: RemovalReason)
-    where
+    pub fn remove<F>(
+        &mut self,
+        parcel_hash: &H256,
+        fetch_nonce: &F,
+        reason: RemovalReason,
+        current_time: &PoolingInstant,
+    ) where
         F: Fn(&Public) -> U256, {
         assert_eq!(self.future.by_priority.len() + self.current.by_priority.len(), self.by_hash.len());
         let parcel = self.by_hash.remove(parcel_hash);
@@ -558,7 +584,7 @@ impl MemPool {
             self.update_future(&signer_public, current_nonce);
             // And now lets check if there is some chain of parcels in future
             // that should be placed in current
-            self.move_matching_future_to_current(signer_public, current_nonce, current_nonce);
+            self.move_matching_future_to_current(signer_public, current_nonce, current_nonce, current_time);
             assert_eq!(self.future.by_priority.len() + self.current.by_priority.len(), self.by_hash.len());
             return
         }
@@ -568,7 +594,7 @@ impl MemPool {
         if order.is_some() {
             // This will keep consistency in pool
             // Moves all to future and then promotes a batch from current:
-            self.cull_internal(signer_public, current_nonce);
+            self.cull_internal(signer_public, current_nonce, current_time);
             assert_eq!(self.future.by_priority.len() + self.current.by_priority.len(), self.by_hash.len());
             return
         }
@@ -576,7 +602,7 @@ impl MemPool {
 
     /// Removes all parcels from particular signer up to (excluding) given client (state) nonce.
     /// Client (State) Nonce = next valid nonce for this signer.
-    pub fn cull(&mut self, signer_public: Public, client_nonce: U256) {
+    pub fn cull(&mut self, signer_public: Public, client_nonce: U256, current_time: &PoolingInstant) {
         // Check if there is anything in current...
         let should_check_in_current = self.current.by_signer_public.row(&signer_public)
             // If nonce == client_nonce nothing is changed
@@ -592,7 +618,7 @@ impl MemPool {
             return
         }
 
-        self.cull_internal(signer_public, client_nonce);
+        self.cull_internal(signer_public, client_nonce, current_time);
     }
 
     /// Removes all elements (in any state) from the pool
@@ -668,6 +694,7 @@ impl MemPool {
         parcel: SignedParcel,
         origin: ParcelOrigin,
         time: PoolingInstant,
+        timelock: Option<BlockNumber>,
         fetch_account: &F,
     ) -> Result<ParcelImportResult, ParcelError>
     where
@@ -723,7 +750,7 @@ impl MemPool {
         // No invalid parcels beyond this point.
         let id = self.next_parcel_id;
         self.next_parcel_id += 1;
-        let vparcel = MemPoolItem::new(parcel, origin, time, id);
+        let vparcel = MemPoolItem::new(parcel, origin, time, id, timelock);
         let r = self.import_parcel(vparcel, client_account.nonce);
         assert_eq!(self.future.by_priority.len() + self.current.by_priority.len(), self.by_hash.len());
         r
@@ -762,7 +789,7 @@ impl MemPool {
         // Update nonces of parcels in future (remove old parcels)
         self.update_future(&signer_public, state_nonce);
         // State nonce could be updated. Maybe there are some more items waiting in future?
-        self.move_matching_future_to_current(signer_public, state_nonce, state_nonce);
+        self.move_matching_future_to_current(signer_public, state_nonce, state_nonce, &parcel.insertion_time);
         // Check the next expected nonce (might be updated by move above)
         let next_nonce = self.last_nonces.get(&signer_public).cloned().map_or(state_nonce, |n| n + U256::one());
 
@@ -792,8 +819,37 @@ impl MemPool {
         }
 
         // We might have filled a gap - move some more parcels from future
-        self.move_matching_future_to_current(signer_public, nonce, state_nonce);
-        self.move_matching_future_to_current(signer_public, nonce + U256::one(), state_nonce);
+        self.move_matching_future_to_current(signer_public, nonce, state_nonce, &parcel.insertion_time);
+        self.move_matching_future_to_current(signer_public, nonce + U256::one(), state_nonce, &parcel.insertion_time);
+
+        if let Some(block_number) = parcel.timelock {
+            if block_number > parcel.insertion_time + 1 {
+                // Check same nonce is in current. If it
+                // is than move the following current items to future.
+                let mut moved_to_future_flag = false;
+                let best_block_number = parcel.insertion_time;
+                if let Some(_) = self.current.by_signer_public.get(&signer_public, &nonce) {
+                    moved_to_future_flag = true;
+                    self.move_all_to_future(&signer_public, state_nonce);
+                }
+
+                check_too_cheap(Self::replace_parcel(
+                    parcel,
+                    state_nonce,
+                    &mut self.future,
+                    &mut self.by_hash,
+                    &mut self.local_parcels,
+                ))?;
+
+                if moved_to_future_flag {
+                    self.move_matching_future_to_current(signer_public, state_nonce, state_nonce, &best_block_number);
+                }
+
+                let removed = self.future.enforce_limit(&mut self.by_hash, &mut self.local_parcels);
+                check_if_removed(&signer_public, &nonce, removed)?;
+                return Ok(ParcelImportResult::Future)
+            }
+        }
 
         // Replace parcel if any
         check_too_cheap(Self::replace_parcel(
@@ -820,7 +876,7 @@ impl MemPool {
     }
 
     /// Always updates future and moves parcel from current to future.
-    fn cull_internal(&mut self, sender: Public, client_nonce: U256) {
+    fn cull_internal(&mut self, sender: Public, client_nonce: U256, current_time: &PoolingInstant) {
         // We will either move parcel to future or remove it completely
         // so there will be no parcels from this sender in current
         self.last_nonces.remove(&sender);
@@ -830,7 +886,7 @@ impl MemPool {
         self.move_all_to_future(&sender, client_nonce);
         // And now lets check if there is some batch of parcels in future
         // that should be placed in current. It should also update last_nonces.
-        self.move_matching_future_to_current(sender, client_nonce, client_nonce);
+        self.move_matching_future_to_current(sender, client_nonce, client_nonce, current_time);
         assert_eq!(self.future.by_priority.len() + self.current.by_priority.len(), self.by_hash.len());
     }
 
@@ -870,7 +926,13 @@ impl MemPool {
 
     /// Checks if there are any parcels in `future` that should actually be promoted to `current`
     /// (because nonce matches).
-    fn move_matching_future_to_current(&mut self, public: Public, mut current_nonce: U256, first_nonce: U256) {
+    fn move_matching_future_to_current(
+        &mut self,
+        public: Public,
+        mut current_nonce: U256,
+        first_nonce: U256,
+        best_block_number: &BlockNumber,
+    ) {
         let mut update_last_nonce_to = None;
         {
             let by_nonce = self.future.by_signer_public.row_mut(&public);
@@ -878,8 +940,14 @@ impl MemPool {
                 return
             }
             let by_nonce = by_nonce.expect("None is tested in early-exit condition above; qed");
-            while let Some(order) = by_nonce.remove(&current_nonce) {
-                // remove also from priority and fee
+            while let Some(order) = by_nonce.clone().get(&current_nonce) {
+                if let Some(lock) = order.timelock {
+                    let next_block = best_block_number + 1;
+                    if lock > next_block {
+                        break
+                    }
+                }
+                let order = by_nonce.remove(&current_nonce).expect("None is tested in the while condition above.");
                 self.future.by_priority.remove(&order);
                 self.future.by_fee.remove(&order.fee, &order.hash);
                 // Put to current
