@@ -22,10 +22,15 @@ use rlp::{Decodable, DecoderError, Encodable, RlpStream, UntrustedRlp};
 
 use super::super::util::unexpected::Mismatch;
 use super::super::{ShardId, WorldId};
+use super::Timelock;
 
 #[derive(Debug, PartialEq, Clone, Eq, Serialize)]
 #[serde(tag = "type", content = "content")]
 pub enum Error {
+    Timelocked {
+        timelock: Timelock,
+        remaining_time: u64,
+    },
     InvalidAssetAmount {
         address: H256,
         expected: u64,
@@ -58,6 +63,8 @@ pub enum Error {
     EmptyInput,
 }
 
+// FIXME: WIP
+const ERROR_ID_TIMELOCKED: u8 = 30u8;
 const ERROR_ID_INVALID_ASSET_AMOUNT: u8 = 4u8;
 const ERROR_ID_ASSET_NOT_FOUND: u8 = 5u8;
 const ERROR_ID_ASSET_SCHEME_NOT_FOUND: u8 = 6u8;
@@ -80,6 +87,10 @@ const ERROR_ID_EMPTY_INPUT: u8 = 21u8;
 impl Encodable for Error {
     fn rlp_append(&self, s: &mut RlpStream) {
         match self {
+            Error::Timelocked {
+                timelock,
+                remaining_time,
+            } => s.begin_list(3).append(&ERROR_ID_TIMELOCKED).append(timelock).append(remaining_time),
             Error::InvalidAssetAmount {
                 address,
                 expected,
@@ -118,6 +129,10 @@ impl Decodable for Error {
     fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
         let tag = rlp.val_at::<u8>(0)?;
         Ok(match tag {
+            ERROR_ID_TIMELOCKED => Error::Timelocked {
+                timelock: rlp.val_at(1)?,
+                remaining_time: rlp.val_at(2)?,
+            },
             ERROR_ID_INVALID_ASSET_AMOUNT => Error::InvalidAssetAmount {
                 address: rlp.val_at(1)?,
                 expected: rlp.val_at(2)?,
@@ -188,6 +203,14 @@ impl Decodable for Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter) -> FormatResult {
         match self {
+            Error::Timelocked {
+                timelock,
+                remaining_time,
+            } => write!(
+                f,
+                "The transaction cannot be executed because of the timelock({:?}). The remaining time is {}",
+                timelock, remaining_time
+            ),
             Error::InvalidAssetAmount {
                 address,
                 expected,
